@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Optional, Union, Callable, Awaitable, AsyncG
 from dataclasses import dataclass, field
 import asyncio
 import json
-from anthropic import Anthropic
+from anthropic import Anthropic, NotGiven
 from anthropic.types import Message, MessageParam
 
 
@@ -196,16 +196,20 @@ class Agent:
         for turn in range(max_turns):
             # Prepare system message
             system_message = current_agent.instructions
+
+            kwargs = {
+                "model": current_agent.model,
+                "max_tokens": current_agent.max_tokens,
+                "temperature": current_agent.temperature,
+                "system": system_message,
+                "messages": messages,
+                "stream": True,
+            }
+            if current_agent._anthropic_tools:
+                kwargs["tools"] = current_agent._anthropic_tools
             
             # Make API call
-            response = await current_agent.client.messages.create(
-                model=current_agent.model,
-                max_tokens=current_agent.max_tokens,
-                temperature=current_agent.temperature,
-                system=system_message,
-                messages=messages,
-                tools=current_agent._anthropic_tools if current_agent._anthropic_tools else None
-            )
+            response = await current_agent.client.messages.create(**kwargs)
             
             # Add assistant message
             messages.append({
@@ -274,17 +278,20 @@ class Agent:
         for turn in range(max_turns):
             # Prepare system message
             system_message = current_agent.instructions
+
+            kwargs = {
+                "model": current_agent.model,
+                "max_tokens": current_agent.max_tokens,
+                "temperature": current_agent.temperature,
+                "system": system_message,
+                "messages": messages,
+                "stream": True,
+            }
+            if current_agent._anthropic_tools:
+                kwargs["tools"] = current_agent._anthropic_tools
             
             # Make streaming API call
-            stream = await current_agent.client.messages.create(
-                model=current_agent.model,
-                max_tokens=current_agent.max_tokens,
-                temperature=current_agent.temperature,
-                system=system_message,
-                messages=messages,
-                #tools=current_agent._anthropic_tools if current_agent._anthropic_tools else NotGiven,
-                stream=True
-            )
+            stream = await current_agent.client.messages.create(**kwargs)
             
             # Collect streamed content
             full_content = []
