@@ -1,82 +1,11 @@
-from typing import Any, Dict, List, Optional, Union, Callable, Awaitable, AsyncGenerator
-from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union, AsyncGenerator
 import asyncio
 import json
-from anthropic import Anthropic, NotGiven
-from anthropic.types import Message, MessageParam
+from anthropic import Anthropic
+from anthropic.types import Message, MessageParam, ThinkingConfigParam, ToolUseBlock, TextBlock
 
-
-@dataclass
-class AgentResult:
-    """Result of an agent run."""
-    final_output: str
-    messages: List[MessageParam] = field(default_factory=list)
-    agent_name: str = ""
-
-
-@dataclass
-class StreamChunk:
-    """A chunk of streamed content."""
-    content: str
-    is_complete: bool = False
-    agent_name: str = ""
-    messages: List[MessageParam] = field(default_factory=list)
-    
-
-class FunctionTool:
-    """Wrapper for function tools."""
-    
-    def __init__(self, func: Callable, name: Optional[str] = None, description: Optional[str] = None):
-        self.func = func
-        self.name = name or func.__name__
-        self.description = description or func.__doc__ or ""
-        
-    def to_anthropic_tool(self) -> Dict[str, Any]:
-        """Convert to Anthropic tool format."""
-        # Get function signature for parameters
-        import inspect
-        sig = inspect.signature(self.func)
-        
-        properties = {}
-        required = []
-        
-        for param_name, param in sig.parameters.items():
-            param_type = "string"  # Default type
-            if param.annotation != inspect.Parameter.empty:
-                if param.annotation == int:
-                    param_type = "integer"
-                elif param.annotation == float:
-                    param_type = "number"
-                elif param.annotation == bool:
-                    param_type = "boolean"
-                    
-            properties[param_name] = {"type": param_type}
-            
-            if param.default == inspect.Parameter.empty:
-                required.append(param_name)
-                
-        return {
-            "name": self.name,
-            "description": self.description,
-            "input_schema": {
-                "type": "object",
-                "properties": properties,
-                "required": required
-            }
-        }
-        
-    async def call(self, **kwargs) -> Any:
-        """Call the function with given arguments."""
-        if asyncio.iscoroutinefunction(self.func):
-            return await self.func(**kwargs)
-        else:
-            return self.func(**kwargs)
-
-
-def function_tool(func: Callable) -> FunctionTool:
-    """Decorator to create a function tool."""
-    return FunctionTool(func)
-
+from app.core.function import FunctionTool
+from app.schemas.response import AgentResult, StreamChunk
 
 class Agent:
     """An agent that can interact with Anthropic's Claude API."""
@@ -91,6 +20,7 @@ class Agent:
         output_type: Optional[type] = None,
         max_tokens: int = 4096,
         temperature: float = 0.0,
+        thinking: ThinkingConfigParam | None = None,
         client: Optional[Anthropic] = None
     ):
         self.name = name
@@ -101,19 +31,23 @@ class Agent:
         self.output_type = output_type
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.thinking = thinking
         self.client = client or Anthropic()
+
+        if self.thinking and self.thinking["type"] == "enabled":
+            self.temperature = 1.0
         
         # Convert function tools to Anthropic format
-        self._anthropic_tools = []
+        self._invoke_tools = []
         self._tool_map = {}
-        
+                
         for tool in self.tools:
             if isinstance(tool, FunctionTool):
                 anthropic_tool = tool.to_anthropic_tool()
-                self._anthropic_tools.append(anthropic_tool)
+                self._invoke_tools.append(anthropic_tool)
                 self._tool_map[tool.name] = tool
             elif isinstance(tool, dict):
-                self._anthropic_tools.append(tool)
+                self._invoke_tools.append(tool)
                 
         # Add handoff tools
         for agent in self.handoffs:
@@ -131,7 +65,7 @@ class Agent:
                     "required": ["message"]
                 }
             }
-            self._anthropic_tools.append(handoff_tool)
+            self._invoke_tools.append(handoff_tool)
             
     async def _process_tool_calls(self, message: Message) -> tuple[List[MessageParam], Optional['Agent'], bool]:
         """Process tool calls and return tool results, handoff agent, and completion status."""
@@ -181,7 +115,10 @@ class Agent:
                         })
                         
         return tool_results, handoff_agent, is_complete
-        
+    
+    def zip_response(self, response: Message) -> str:
+        return ""
+
     async def run(self, input_message: List[MessageParam] | str, max_turns: int = 10) -> AgentResult:
         """Run the agent with the given input."""
         if isinstance(input_message, str):
@@ -192,10 +129,33 @@ class Agent:
             messages = input_message
         
         current_agent = self
+        tool_blocks = []
+        tool_result_blocks = []
+        thinking_blocks = []
         
         for turn in range(max_turns):
             # Prepare system message
             system_message = current_agent.instructions
+
+            if len(tool_blocks) > 0 or len(thinking_blocks) > 0:
+                interleaved_blocks = []
+                if len(thinking_blocks) > 0:
+                    interleaved_blocks.append(thinking_blocks[-1])
+                    interleaved_blocks.append(tool_blocks[-1])
+                messages.append({
+                    "role": "assistant",
+                    "content": interleaved_blocks
+                })
+
+                thinking_blocks = []
+                tool_blocks = []
+            
+            if len(tool_result_blocks) > 0:
+                messages.append({
+                    "role": "user",
+                    "content": tool_result_blocks
+                })
+                tool_result_blocks = []
 
             kwargs = {
                 "model": current_agent.model,
@@ -203,66 +163,42 @@ class Agent:
                 "temperature": current_agent.temperature,
                 "system": system_message,
                 "messages": messages,
-                "stream": True,
+                "thinking": current_agent.thinking,
             }
-            if current_agent._anthropic_tools:
-                kwargs["tools"] = current_agent._anthropic_tools
+            if current_agent._invoke_tools:
+                kwargs["tools"] = current_agent._invoke_tools
             
             # Make API call
             response = await current_agent.client.messages.create(**kwargs)
-            
-            # Add assistant message
-            messages.append({
-                "role": "assistant",
-                "content": response.content
-            })
+            final_block = response.content[-1] if response.content else None
+
+            if final_block and not isinstance(final_block, TextBlock):
+                for block in response.content:
+                    if block.type == "thinking" or block.type == "redacted_thinking":
+                        thinking_blocks.append(block)
+                    elif block.type == "tool_use" or block.type == "server_tool_use":
+                        tool_blocks.append(block)
+                    elif block.type == "web_search_tool_result":
+                        tool_result_blocks.append(block)
             
             # Process tool calls
             tool_results, handoff_agent, is_complete = await current_agent._process_tool_calls(response)
-            
-            # Handle handoff
-            if handoff_agent:
-                current_agent = handoff_agent
-                continue
-                
-            # Add tool results if any
-            if tool_results:
-                messages.extend(tool_results)
-                continue
-                
-            # Check for completion
-            if response.content and len(response.content) > 0:
-                final_content = ""
-                for content_block in response.content:
-                    if content_block.type == "text":
-                        final_content += content_block.text
-                        
-                # If no tools were called and we have text content, we're done
-                if final_content and not any(block.type == "tool_use" for block in response.content):
-                    return AgentResult(
-                        final_output=final_content,
-                        messages=messages,
-                        agent_name=current_agent.name
-                    )
-                    
-        # If we've reached max turns, return the last response
-        final_content = ""
-        if messages and messages[-1]["role"] == "assistant":
-            content = messages[-1]["content"]
-            if isinstance(content, list):
-                for block in content:
-                    if hasattr(block, 'text'):
-                        final_content += block.text
-                    elif isinstance(block, dict) and block.get('type') == 'text':
-                        final_content += block.get('text', '')
-            elif isinstance(content, str):
-                final_content = content
-                
-        return AgentResult(
-            final_output=final_content,
-            messages=messages,
-            agent_name=current_agent.name
-        )
+            tool_result_blocks.extend(tool_results)
+
+            final_block = response.content[-1] if response.content else None
+
+            if final_block and isinstance(final_block, TextBlock):
+                final_output = self.zip_response(response)
+                return AgentResult(
+                    final_output=final_output,
+                    messages=messages,
+                    agent_name=current_agent.name
+                )
+            return AgentResult(
+                final_output="I'm sorry, I got an unexpected response.",
+                messages=messages,
+                agent_name=current_agent.name
+            )
         
     async def run_stream(self, messages: List[MessageParam] | str, max_turns: int = 10) -> AsyncGenerator[StreamChunk, None]:
         """Run the agent with streaming output."""
@@ -287,8 +223,8 @@ class Agent:
                 "messages": messages,
                 "stream": True,
             }
-            if current_agent._anthropic_tools:
-                kwargs["tools"] = current_agent._anthropic_tools
+            if current_agent._invoke_tools:
+                kwargs["tools"] = current_agent._invoke_tools
             
             # Make streaming API call
             stream = await current_agent.client.messages.create(**kwargs)
