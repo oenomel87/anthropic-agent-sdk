@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Optional, Union, AsyncGenerator
 import asyncio
 import json
 from anthropic import Anthropic
-from anthropic.types import Message, MessageParam, ThinkingConfigParam, ToolUseBlock, TextBlock
+from anthropic.types import Message, MessageParam, ThinkingConfigParam, ContentBlock, TextBlock
 
 from app.core.function import FunctionTool
 from app.schemas.response import AgentResult, StreamChunk
@@ -43,7 +43,7 @@ class Agent:
                 
         for tool in self.tools:
             if isinstance(tool, FunctionTool):
-                anthropic_tool = tool.to_anthropic_tool()
+                anthropic_tool = tool.to_invoke_tool()
                 self._invoke_tools.append(anthropic_tool)
                 self._tool_map[tool.name] = tool
             elif isinstance(tool, dict):
@@ -67,52 +67,50 @@ class Agent:
             }
             self._invoke_tools.append(handoff_tool)
             
-    async def _process_tool_calls(self, message: Message) -> tuple[List[MessageParam], Optional['Agent'], bool]:
+    async def _process_tool_calls(self, content_block: ContentBlock) -> tuple[List[MessageParam], Optional['Agent'], bool]:
         """Process tool calls and return tool results, handoff agent, and completion status."""
         tool_results = []
         handoff_agent = None
         is_complete = False
         
-        if not message.content:
+        if not content_block:
             return tool_results, handoff_agent, True
             
-        for content_block in message.content:
-            if hasattr(content_block, 'type') and content_block.type == "tool_use":
-                tool_name = content_block.name
-                tool_input = content_block.input
-                tool_use_id = content_block.id
+        if hasattr(content_block, 'type') and content_block.type == "tool_use":
+            tool_name = content_block.name
+            tool_input = content_block.input
+            tool_use_id = content_block.id
+            
+            # Check for handoff
+            if tool_name.startswith("handoff_to_"):
+                agent_name = tool_name.replace("handoff_to_", "").replace("_", " ")
+                for agent in self.handoffs:
+                    if agent.name.lower().replace(" ", "_") == agent_name:
+                        handoff_agent = agent
+                        break
                 
-                # Check for handoff
-                if tool_name.startswith("handoff_to_"):
-                    agent_name = tool_name.replace("handoff_to_", "").replace("_", " ")
-                    for agent in self.handoffs:
-                        if agent.name.lower().replace(" ", "_") == agent_name:
-                            handoff_agent = agent
-                            break
-                    
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": f"Handed off to {agent_name}"
+                })
+                
+            # Execute function tool
+            if tool_name in self._tool_map:
+                try:
+                    result = await self._tool_map[tool_name].call(**tool_input)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
-                        "content": f"Handed off to {agent_name}"
+                        "content": str(result)
                     })
-                    continue
-                    
-                # Execute function tool
-                if tool_name in self._tool_map:
-                    try:
-                        result = await self._tool_map[tool_name].call(**tool_input)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": str(result)
-                        })
-                    except Exception as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": f"Error: {str(e)}",
-                            "is_error": True
-                        })
+                except Exception as e:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": f"Error: {str(e)}",
+                        "is_error": True
+                    })
                         
         return tool_results, handoff_agent, is_complete
     
@@ -129,26 +127,19 @@ class Agent:
             messages = input_message
         
         current_agent = self
-        tool_blocks = []
+        block_caches: List[ContentBlock] = []
         tool_result_blocks = []
-        thinking_blocks = []
         
         for turn in range(max_turns):
             # Prepare system message
             system_message = current_agent.instructions
 
-            if len(tool_blocks) > 0 or len(thinking_blocks) > 0:
-                interleaved_blocks = []
-                if len(thinking_blocks) > 0:
-                    interleaved_blocks.append(thinking_blocks[-1])
-                    interleaved_blocks.append(tool_blocks[-1])
+            if len(block_caches) > 0:
                 messages.append({
                     "role": "assistant",
-                    "content": interleaved_blocks
+                    "content": block_caches
                 })
-
-                thinking_blocks = []
-                tool_blocks = []
+                block_caches = []
             
             if len(tool_result_blocks) > 0:
                 messages.append({
@@ -175,20 +166,16 @@ class Agent:
             if final_block and not isinstance(final_block, TextBlock):
                 for block in response.content:
                     if block.type == "thinking" or block.type == "redacted_thinking":
-                        thinking_blocks.append(block)
-                    elif block.type == "tool_use" or block.type == "server_tool_use":
-                        tool_blocks.append(block)
-                    elif block.type == "web_search_tool_result":
-                        tool_result_blocks.append(block)
-            
-            # Process tool calls
-            tool_results, handoff_agent, is_complete = await current_agent._process_tool_calls(response)
-            tool_result_blocks.extend(tool_results)
-
-            final_block = response.content[-1] if response.content else None
+                        block_caches.append(block)
+                    elif block.type == "tool_use":
+                        block_caches.append(block)
+                        # Process tool calls
+                        tool_results, handoff_agent, is_complete = await current_agent._process_tool_calls(block)
+                        tool_result_blocks.extend(tool_results)
+                continue
 
             if final_block and isinstance(final_block, TextBlock):
-                final_output = self.zip_response(response)
+                final_output = final_block.text.strip()
                 return AgentResult(
                     final_output=final_output,
                     messages=messages,
@@ -210,10 +197,28 @@ class Agent:
             ]
         else:
             messages = messages
+
+        current_agent = self
+        skip_tool_use = True
+        block_caches: List[ContentBlock] = []
+        tool_result_blocks = []
             
         for turn in range(max_turns):
             # Prepare system message
             system_message = current_agent.instructions
+
+            if len(block_caches) > 0:
+                messages.append({
+                    "role": "assistant",
+                    "content": block_caches
+                })
+                block_caches = []
+            if len(tool_result_blocks) > 0:
+                messages.append({
+                    "role": "user",
+                    "content": tool_result_blocks
+                })
+                tool_result_blocks = []
 
             kwargs = {
                 "model": current_agent.model,
@@ -223,57 +228,96 @@ class Agent:
                 "messages": messages,
                 "stream": True,
             }
+
             if current_agent._invoke_tools:
                 kwargs["tools"] = current_agent._invoke_tools
             
-            # Make streaming API call
-            stream = await current_agent.client.messages.create(**kwargs)
-            
-            # Collect streamed content
-            full_content = []
-            current_text = ""
-            
-            async for chunk in stream:
-                if chunk.type == "message_start":
-                    continue
-                elif chunk.type == "content_block_start":
-                    if chunk.content_block.type == "text":
-                        current_text = ""
-                elif chunk.type == "content_block_delta":
-                    if chunk.delta.type == "text_delta":
-                        current_text += chunk.delta.text
+            async with current_agent.client.messages.stream(**kwargs) as stream:
+                async for event in stream:
+                    if event.type == "message_start":
+                        skip_tool_use = True
+                        continue
+                    elif event.type == "content_block_start":
+                        if event.content_block.type == "text":
+                            yield StreamChunk(
+                                type="text_start",
+                                content="\n<text>\n",
+                                is_complete=False,
+                                agent_name=current_agent.name,
+                            )
+                        elif event.content_block.type == "thinking":
+                            yield StreamChunk(
+                                type="thinking_start",
+                                content="\n<thinking>\n",
+                                is_complete=False,
+                                agent_name=current_agent.name,
+                            )
+                        elif event.content_block.type == "tool_use":
+                            skip_tool_use = False
+                            yield StreamChunk(
+                                type="tool_use_start",
+                                content="\n<tool_use>\n",
+                                is_complete=False,
+                                agent_name=current_agent.name,
+                            )
+                    elif event.type == "thinking":
                         yield StreamChunk(
-                            content=chunk.delta.text,
+                            type="thinking",
+                            content=event.thinking,
                             is_complete=False,
                             agent_name=current_agent.name,
-                            messages=messages
                         )
-                elif chunk.type == "content_block_stop":
-                    if current_text:
-                        full_content.append({
-                            "type": "text",
-                            "text": current_text
-                        })
-                elif chunk.type == "message_delta":
-                    continue
-                elif chunk.type == "message_stop":
-                    break
+                    elif event.type == "text":
+                        yield StreamChunk(
+                            type="text",
+                            content=event.text,
+                            is_complete=False,
+                            agent_name=current_agent.name,
+                        )
+                    elif event.type == "content_block_stop":
+                        if event.content_block.type == "text":
+                            block_caches.append(event.content_block)
+                            yield StreamChunk(
+                                type="text_stop",
+                                content="\n</text>\n",
+                                is_complete=False,
+                                agent_name=current_agent.name,
+                            )
+                        elif event.content_block.type == "thinking":
+                            block_caches.append(event.content_block)
+                            yield StreamChunk(
+                                type="thinking_stop",
+                                content="\n</thinking>\n",
+                                is_complete=False,
+                                agent_name=current_agent.name,
+                            )
+                        elif event.content_block.type == "tool_use":
+                            block_caches.append(event.content_block)
+                            yield StreamChunk(
+                                type="tool_use_stop",
+                                content="\n</tool_use>\n",
+                                is_complete=False,
+                                agent_name=current_agent.name,
+                            )
+                    elif event.type == "message_stop":
+                        break
+            if skip_tool_use:
+                yield StreamChunk(
+                    content="",
+                    is_complete=True,
+                    agent_name=current_agent.name,
+                    type="text"
+                )
             
-            # Add assistant message
-            messages.append({
-                "role": "assistant",
-                "content": full_content
-            })
-            
-            # Create a mock response object for tool processing
-            class MockResponse:
-                def __init__(self, content):
-                    self.content = content
-            
-            mock_response = MockResponse(full_content)
+            yield StreamChunk(
+                content="\n<tool_result>\n",
+                is_complete=False,
+                agent_name=current_agent.name,
+                type="tool_result_start"
+            )
             
             # Process tool calls
-            tool_results, handoff_agent, is_complete = await current_agent._process_tool_calls(mock_response)
+            tool_results, handoff_agent, is_complete = await current_agent._process_tool_calls(content_block=block_caches[-1] if block_caches else None)
             
             # Handle handoff
             if handoff_agent:
@@ -288,32 +332,14 @@ class Agent:
                 
             # Add tool results if any
             if tool_results:
-                messages.extend(tool_results)
+                tool_result_blocks.extend(tool_results)
                 continue
-                
-            # Check for completion
-            if full_content and len(full_content) > 0:
-                final_content = ""
-                for content_block in full_content:
-                    if content_block.get("type") == "text":
-                        final_content += content_block.get("text", "")
-                        
-                # If no tools were called and we have text content, we're done
-                if final_content and not any(block.get("type") == "tool_use" for block in full_content):
-                    yield StreamChunk(
-                        content="",
-                        is_complete=True,
-                        agent_name=current_agent.name,
-                        messages=messages
-                    )
-                    return
-                    
         # If we've reached max turns, signal completion
         yield StreamChunk(
             content="",
+            type="error",
             is_complete=True,
-            agent_name=current_agent.name,
-            messages=messages
+            agent_name=current_agent.name
         )
 
 

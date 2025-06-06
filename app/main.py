@@ -1,15 +1,32 @@
 import asyncio
 import os
+import traceback
 from typing import List
 from anthropic import AsyncAnthropic
 from anthropic.types import Message, MessageParam
 from app.core.agent import Agent, Runner
 from dotenv import load_dotenv
+
+from app.tools.upbit import (
+    get_current_ticker,
+    get_candles_for_minutes,
+    get_candles_for_daily,
+    get_candles_for_weekly
+)
+from app.tools.analyze import analyze_btc_mareket
+
 load_dotenv()
 
 async def run():
     messages: List[MessageParam] = []
     client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    tools = [
+        get_current_ticker,
+        get_candles_for_minutes,
+        get_candles_for_daily,
+        get_candles_for_weekly,
+        analyze_btc_mareket
+    ]
     simple_agent = Agent(
         name="Assistant",
         model="claude-sonnet-4-20250514",
@@ -19,6 +36,7 @@ async def run():
             "type": "enabled",
             "budget_tokens": 1024,
         },
+        tools=tools,
         client=client
     )
 
@@ -31,6 +49,7 @@ async def run():
             response = await Runner.run(simple_agent, messages)
             print(response.final_output)
     except Exception as e:
+        traceback.print_exc()
         print(f"An error occurred: {e}")
 
 async def run_stream():

@@ -4,10 +4,12 @@ import numpy as np
 import math
 from datetime import datetime
 
+from app.core.function import function_tool
 from app.tools.upbit import get_current_ticker, get_candles_for_daily, get_candles_for_minutes, get_candles_for_weekly
 from app.schemas.ticker import Ticker
 from app.schemas.candle import MinuteCandleStick, DailyCandleStick, WeeklyCandleStick
 
+@function_tool
 async def get_market_info() -> dict:
     """
     비트코인의 시장 정보(market_info)를 구하는 함수
@@ -902,6 +904,7 @@ async def get_technical_signals() -> dict:
     
     return technical_signals
 
+@function_tool
 async def analyze_btc_mareket() -> dict:
     """
     비트코인 시장 분석 시스템 실행
